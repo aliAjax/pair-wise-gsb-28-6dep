@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "npx -y node@22 --experimental-strip-types --no-warnings src/logic/loading.test.ts"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.0.2",

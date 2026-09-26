@@ -1,288 +1,144 @@
-import { FormEvent, useMemo, useState } from "react";
+/**
+ * 页面层：只负责布局、拖拽编排与用户交互。
+ * 规则判断全部走 src/logic/loading.ts，资料全部来自 src/data/*，本文件不写业务规则。
+ */
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: string[];
-};
-
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
-
-const project = {
-  "number": 14,
-  "folder": "hxwl/frontend/hxwlfront-14",
-  "framework": "react",
-  "title": "配送任务拖拽排班",
-  "subtitle": "把待分配订单安排给司机，并统计任务数和总重量。",
-  "industry": "物流",
-  "stack": [
-    "React",
-    "Vite",
-    "TypeScript",
-    "Ant Design",
-    "dnd-kit"
-  ],
-  "storageKey": "hxwlfront-14-schedule",
-  "formTitle": "新增待分配订单",
-  "primaryAction": "加入待分配",
-  "entityLabel": "订单",
-  "statuses": [
-    "待分配",
-    "已分配",
-    "已完成"
-  ],
-  "filters": [
-    "全部司机",
-    "刘师傅",
-    "赵师傅",
-    "孙师傅"
-  ],
-  "fields": [
-    {
-      "key": "orderNo",
-      "label": "订单号"
-    },
-    {
-      "key": "driver",
-      "label": "司机",
-      "type": "select",
-      "options": [
-        "刘师傅",
-        "赵师傅",
-        "孙师傅"
-      ]
-    },
-    {
-      "key": "weight",
-      "label": "重量kg",
-      "type": "number"
-    },
-    {
-      "key": "destination",
-      "label": "目的地"
-    }
-  ],
-  "records": [
-    {
-      "orderNo": "ORD-9012",
-      "driver": "刘师傅",
-      "weight": 260,
-      "destination": "浦东",
-      "status": "已分配",
-      "notes": "上午配送"
-    },
-    {
-      "orderNo": "ORD-9031",
-      "driver": "赵师傅",
-      "weight": 140,
-      "destination": "嘉定",
-      "status": "待分配",
-      "notes": "待排班"
-    }
-  ],
-  "metricLabels": [
-    "订单数",
-    "已分配",
-    "总重量"
-  ]
-} as const;
-
-const fields = project.fields as unknown as Field[];
-const statuses: string[] = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
-}
-
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
-}
-
-function saveRecords(records: RecordItem[]) {
-  localStorage.setItem(project.storageKey, JSON.stringify(records));
-}
-
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
-}
-
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
-}
+import { useMemo, useState } from "react";
+import {
+  DndContext,
+  DragOverlay,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+  type DragStartEvent
+} from "@dnd-kit/core";
+import { ORDERS, ORDERS_BY_ID } from "./data/orders";
+import { totalWeight } from "./logic/loading";
+import { selectPendingOrderIds, useDispatchStore } from "./state/dispatchStore";
+import { OrderCardContent } from "./components/OrderCard";
+import { PendingPool } from "./components/PendingPool";
+import { TruckCard } from "./components/TruckCard";
+import { RejectLog } from "./components/RejectLog";
 
 export default function App() {
-  const [records, setRecords] = useState<RecordItem[]>(loadRecords);
-  const [form, setForm] = useState<Record<string, string | number>>(createBlank);
-  const [note, setNote] = useState("");
-  const [filter, setFilter] = useState<string>(project.filters[0]);
+  const trucks = useDispatchStore((state) => state.trucks);
+  const assignOrder = useDispatchStore((state) => state.assignOrder);
+  const resetAll = useDispatchStore((state) => state.resetAll);
+  const [activeOrderId, setActiveOrderId] = useState<string | null>(null);
+  const [showRules, setShowRules] = useState(false);
 
-  const filteredRecords = useMemo(() => {
-    if (filter.startsWith("全部")) return records;
-    return records.filter((record) => Object.values(record).includes(filter));
-  }, [filter, records]);
+  // 约束在订单卡片上按下后移动 6px 才算拖拽，避免和卡片内下拉框冲突
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
   const metrics = useMemo(() => {
-    const total = records.length;
-    const second = records.filter((record) => record.status === statuses[1]).length;
-    const third = records.filter((record) => record.status === statuses[2]).length;
-    const numberValues = records.flatMap((record) =>
-      fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
+    const allIds = Object.values(trucks).flatMap((truck) => truck.orderIds);
+    const loadedWeight = totalWeight(
+      allIds.map((id) => ORDERS_BY_ID.get(id)!).filter(Boolean)
     );
-    const sum = numberValues.reduce((acc, value) => acc + value, 0);
-    return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-  }, [records]);
+    const departedCount = Object.values(trucks).filter((truck) => truck.departed).length;
+    return {
+      pending: selectPendingOrderIds(trucks).length,
+      loaded: allIds.length,
+      loadedWeight,
+      departed: departedCount
+    };
+  }, [trucks]);
 
-  const chartRows = statuses.map((status) => ({
-    status,
-    value: records.filter((record) => record.status === status).length
-  }));
-  const maxChart = Math.max(1, ...chartRows.map((row) => row.value));
+  const handleDragStart = (event: DragStartEvent) => {
+    setActiveOrderId(String(event.active.data.current?.orderId ?? ""));
+  };
 
-  function updateRecords(next: RecordItem[]) {
-    setRecords(next);
-    saveRecords(next);
-  }
-
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const next: RecordItem = {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem;
-    updateRecords([next, ...records]);
-    setForm(createBlank());
-    setNote("");
-  }
+  const handleDragEnd = (event: DragEndEvent) => {
+    setActiveOrderId(null);
+    const orderId = event.active.data.current?.orderId as string | undefined;
+    const truckId = event.over?.data.current?.truckId as string | undefined;
+    if (orderId && truckId) {
+      assignOrder(truckId, orderId);
+      // 退回结果已由 store 记录并在待分配区/退回记录中展示
+    }
+  };
 
   return (
     <main className="app">
       <div className="shell">
         <header className="topbar">
           <div>
-            <p className="eyebrow">{project.industry}行业前端最小闭环</p>
-            <h1>{project.title}</h1>
-            <p className="subtitle">{project.subtitle}</p>
+            <p className="eyebrow">配送装车排车台</p>
+            <h1>按送达顺序装车 · 拖拽排车</h1>
+            <p className="subtitle">
+              远点先装、近点靠门，先送的货不再被压在车底。顺序冲突或超重的订单自动退回待分配区，发车后顺序锁死，换班照单接车。
+            </p>
           </div>
-          <div className="stack">{project.stack.map((item) => <span className="tag" key={item}>{item}</span>)}</div>
+          <div className="top-actions">
+            <button type="button" className="ghost-btn" onClick={() => setShowRules((v) => !v)}>
+              {showRules ? "收起规则" : "装车规则"}
+            </button>
+            <button
+              type="button"
+              className="ghost-btn danger-ghost"
+              onClick={() => {
+                if (window.confirm("确定清空所有车次、退回记录并重新开始？该操作不可撤销。")) {
+                  resetAll();
+                }
+              }}
+            >
+              清空重来
+            </button>
+          </div>
         </header>
 
-        <section className="metrics">
-          {project.metricLabels.map((label, index) => (
-            <article className="metric" key={label}>
-              <span>{label}</span>
-              <strong>{metrics[index]}</strong>
-            </article>
-          ))}
-        </section>
-
-        <section className="workspace">
-          <form className="panel" onSubmit={handleSubmit}>
-            <h2>{project.formTitle}</h2>
-            <div className="form-grid">
-              {fields.map((field) => (
-                <label key={field.key}>
-                  {field.label}
-                  {field.type === "select" ? (
-                    <select
-                      value={String(form[field.key])}
-                      onChange={(event) => setForm({ ...form, [field.key]: event.target.value })}
-                      required
-                    >
-                      <option value="">请选择</option>
-                      {field.options?.map((option) => <option key={option}>{option}</option>)}
-                    </select>
-                  ) : (
-                    <input
-                      type={field.type || "text"}
-                      value={form[field.key]}
-                      onChange={(event) =>
-                        setForm({ ...form, [field.key]: field.type === "number" ? Number(event.target.value) : event.target.value })
-                      }
-                      required
-                    />
-                  )}
-                </label>
-              ))}
-              <label>
-                备注
-                <textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="填写处理说明或现场备注" />
-              </label>
-              <button type="submit">{project.primaryAction}</button>
-            </div>
-          </form>
-
-          <section className="list-panel">
-            <div className="toolbar">
-              <h2>{project.entityLabel}列表</h2>
-              <select value={filter} onChange={(event) => setFilter(event.target.value)}>
-                {project.filters.map((item) => <option key={item}>{item}</option>)}
-              </select>
-            </div>
-
-            <div className="record-grid">
-              {filteredRecords.length === 0 ? <div className="empty">暂无匹配数据</div> : filteredRecords.map((record) => (
-                <article className="record" key={record.id}>
-                  <div className="record-head">
-                    <p className="record-title">{primaryText(record)}</p>
-                    <span className="status">{record.status}</span>
-                  </div>
-                  <div className="details">
-                    {fields.map((field) => (
-                      <span key={field.key}>{field.label}: {record[field.key]}</span>
-                    ))}
-                  </div>
-                  <p className="note">{record.notes}</p>
-                  <div className="actions">
-                    <button type="button" onClick={() => updateRecords(records.map((item) => item.id === record.id ? { ...item, status: nextStatus(item.status) } : item))}>
-                      流转状态
-                    </button>
-                    <button className="secondary" type="button" onClick={() => navigator.clipboard?.writeText(primaryText(record))}>
-                      复制摘要
-                    </button>
-                    <button className="danger" type="button" onClick={() => updateRecords(records.filter((item) => item.id !== record.id))}>
-                      删除
-                    </button>
-                  </div>
-                </article>
-              ))}
-            </div>
-
-            <div className="mini-chart">
-              {chartRows.map((row) => (
-                <div className="bar" key={row.status}>
-                  <span>{row.status}</span>
-                  <div className="bar-track"><div className="bar-fill" style={{ width: `${(row.value / maxChart) * 100}%` }} /></div>
-                  <strong>{row.value}</strong>
-                </div>
-              ))}
-            </div>
+        {showRules && (
+          <section className="rules-panel">
+            <h3>装车与退回规则</h3>
+            <ol>
+              <li><strong>送达顺序</strong>：距仓近的先送（数字小的在前），开门第一单就是最近点，不用整车翻找。</li>
+              <li><strong>装车顺序</strong>：与送达相反 —— 最远点先装车厢最里，最近点最后装、靠车门放。拖入新车次会自动插到正确位置。</li>
+              <li><strong>顺序冲突退回</strong>：同一送达点同距离（谁先谁后排不出），或客户硬性要求与"近点先送"矛盾时退回待分配区，记录被车上哪一单挡住。</li>
+              <li><strong>超重退回</strong>：加入后单趟总重超过该车核定载重即退回，写明超出多少公斤、被靠门先送的哪一单挡住。</li>
+              <li><strong>发车锁定</strong>：发车后订单顺序与重量生成指纹快照，不能再增删；换班只改司机，订单照原顺序交接。</li>
+              <li><strong>重开核对</strong>：订单资料、装车判断、页面分开维护；刷新重开后按资料重新核算重量并与发车指纹逐项核对，少货/多货/换序/改重都会报出。</li>
+            </ol>
+            <p className="rules-data-note">
+              资料示例：共 {ORDERS.length} 个待分配订单，3 个车次。可尝试把 O-1011 拖到已装 O-1003 的车（同点同距冲突），
+              把 O-1012 与 O-1006 装同车（客户要求与距离冲突），或向赵师傅/孙师傅的车连续装单触发超重。
+            </p>
           </section>
+        )}
+
+        <section className="metrics">
+          <article className="metric"><span>待分配</span><strong>{metrics.pending}</strong><em>单</em></article>
+          <article className="metric"><span>已装车</span><strong>{metrics.loaded}</strong><em>单</em></article>
+          <article className="metric"><span>在车总重</span><strong>{metrics.loadedWeight}</strong><em>kg</em></article>
+          <article className="metric"><span>已发车锁定</span><strong>{metrics.departed}</strong><em>车</em></article>
         </section>
+
+        <DndContext sensors={sensors} onDragStart={handleDragStart} onDragEnd={handleDragEnd} onDragCancel={() => setActiveOrderId(null)}>
+          <div className="workspace">
+            <PendingPool />
+            <div className="truck-grid">
+              {Object.values(trucks).map((truck) => (
+                <TruckCard key={truck.truckId} truck={truck} />
+              ))}
+            </div>
+          </div>
+
+          <DragOverlay dropAnimation={null}>
+            {activeOrderId && ORDERS_BY_ID.get(activeOrderId) ? (
+              <div className="drag-overlay">
+                <article className="order-card no-drag">
+                  <OrderCardContent orderId={activeOrderId} />
+                </article>
+              </div>
+            ) : null}
+          </DragOverlay>
+        </DndContext>
+
+        <RejectLog />
+
+        <footer className="footer-note">
+          数据仅保存在本机浏览器（localStorage），订单资料改在 <code>src/data/</code>，装车规则改在 <code>src/logic/loading.ts</code>，页面互不耦合。
+        </footer>
       </div>
     </main>
   );
